@@ -1,0 +1,68 @@
+# Paper Radar configuration.
+
+[model]
+# Soket model id used for relevance scoring and summaries.
+model = "GLM-5.3"
+
+[arxiv]
+# arXiv categories fetched every morning.
+categories = ["cs.CL", "cs.LG", "cs.AI", "cs.DC", "cs.CR"]
+# Contact email for the arXiv User-Agent (required by arXiv etiquette).
+contact_email = "team@example.com"
+# Rate limit: at least 3 seconds between arXiv requests.
+request_interval_secs = 3
+
+[topics]
+# Team interest profile seed topics.
+topics = [
+    "LiteLLM",
+    "SGLang",
+    "Megatron",
+    "model testing",
+    "Rust ML systems",
+    "sovereign AI for India (Indic and multilingual LLMs, tokenizers, low-resource languages)",
+    "model training and scaling",
+    "RL (RLHF, GRPO, DPO)",
+    "SFT",
+    "LLM inference and serving (KV cache, batching, speculative decoding, quantization)",
+    "GCP",
+    "Kubernetes and GPU cluster scheduling",
+    "model attacks (jailbreaks, prompt injection, red-teaming, safety)",
+    "new model releases and technical reports",
+]
+
+# Keyword prefilter (no LLM): papers whose title+abstract match none of these
+# are dropped before scoring. Case-insensitive; whole-word where it matters.
+keywords = [
+    "llm", "large language model", "language model", "transformer",
+    "inference", "serving", "kv cache", "batching", "speculative decoding",
+    "quantization", "tokenizer", "tokenization", "low-resource",
+    "multilingual", "indic", "fine-tuning", "finetuning", "sft",
+    "rlhf", "grpo", "dpo", "reinforcement learning", "reward model",
+    "scaling law", "training", "distributed training", "megatron",
+    "sglang", "litellm", "vllm", "rust", "gpu", "kubernetes",
+    "cluster scheduling", "gcp", "jailbreak", "prompt injection",
+    "red-team", "red team", "safety", "alignment", "model evaluation",
+    "model testing", "benchmark", "technical report", "model release",
+]
+
+[digest]
+# Minimum LLM relevance score (0-10) for a paper to be eligible.
+min_score = 7
+# Maximum papers posted per digest.
+max_papers = 5
+# Whether to post a one-line message when nothing passes the threshold.
+post_when_empty = true
+
+[slack]
+# Channel ID of the team's papers channel (not the channel name).
+channel_id = "C0CCLRR1PNF"
+# Rate limit for "go deeper" requests per user.
+deeper_rate_limit_per_hour = 5
+
+[schedule]
+# Daily digest time and timezone.
+time = "09:00"
+timezone = "Asia/Kolkata"
+# Weekdays only.
+weekdays_only = true
