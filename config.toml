@@ -8,7 +8,7 @@ model = "GLM-5.3"
 # arXiv categories fetched every morning.
 categories = ["cs.CL", "cs.LG", "cs.AI", "cs.DC", "cs.CR"]
 # Contact email for the arXiv User-Agent (required by arXiv etiquette).
-contact_email = "team@example.com"
+contact_email = "raunak.saoji@soket.ai"
 # Rate limit: at least 3 seconds between arXiv requests.
 request_interval_secs = 3
 
