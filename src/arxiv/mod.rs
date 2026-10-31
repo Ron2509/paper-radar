@@ -1,15 +1,18 @@
 //! arXiv fetching and parsing.
 //!
-//! Queries the arXiv Atom feed for the configured categories, restricted
-//! with a `submittedDate` range to papers submitted within a recent window
-//! (default 48 hours), and pages through the results with `start` /
-//! `max_results` until an empty page (hard cap [`MAX_PAPERS`]). The network
-//! allowlist (HTTPS only, `export.arxiv.org` / `arxiv.org`) is enforced on
-//! every request and on every redirect hop, requests are rate limited to at
-//! least one every 3 seconds per arXiv etiquette, and entries are parsed
-//! into [`Paper`] structs. Feed parsing is pure and unit tested against a
-//! saved fixture; HTTP goes through the [`FeedFetcher`] trait so tests
-//! never touch the real arXiv.
+//! Daily fetching uses arXiv's RSS feed (`https://rss.arxiv.org/rss/<cats>`),
+//! which lists exactly the papers announced today: only items with announce
+//! type "new" or "cross" are kept (replacements are updated old papers). The
+//! Atom search API code ([`build_query_url`], [`fetch_by_query`]) is kept
+//! for later id-based lookups: it queries a `submittedDate` range and pages
+//! through results with `start` / `max_results` until an empty page (hard
+//! cap [`MAX_PAPERS`]). The network allowlist (HTTPS only,
+//! `export.arxiv.org` / `arxiv.org` / `rss.arxiv.org`) is enforced on every
+//! request and on every redirect hop, requests are rate limited to at least
+//! one every 3 seconds per arXiv etiquette, and entries are parsed into
+//! [`Paper`] structs. Feed parsing is pure and unit tested against saved
+//! fixtures; HTTP goes through the [`FeedFetcher`] trait so tests never
+//! touch the real arXiv.
 
 // TODO(wiring): remove once `main` starts using this module; until then
 // these types are only consumed by tests.
@@ -24,7 +27,7 @@ use tokio::sync::Mutex;
 use url::Url;
 
 /// Hosts we are allowed to talk to for paper metadata (all over HTTPS).
-const ALLOWED_HOSTS: [&str; 2] = ["export.arxiv.org", "arxiv.org"];
+const ALLOWED_HOSTS: [&str; 3] = ["export.arxiv.org", "arxiv.org", "rss.arxiv.org"];
 
 /// Maximum accepted response body (5 MB).
 const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
@@ -45,7 +48,7 @@ pub const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
 #[derive(Debug, Error)]
 pub enum ArxivError {
     /// The URL is not HTTPS or its host is not on the allowlist.
-    #[error("host not allowed: {0} (allowed: export.arxiv.org, arxiv.org)")]
+    #[error("host not allowed: {0} (allowed: export.arxiv.org, arxiv.org, rss.arxiv.org)")]
     HostNotAllowed(String),
     /// A malformed URL.
     #[error("invalid URL {url}: {source}")]
@@ -264,6 +267,188 @@ fn normalise_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Builds the arXiv daily RSS feed URL for the given categories, e.g.
+/// `https://rss.arxiv.org/rss/cs.CL+cs.LG`.
+pub fn build_rss_url(categories: &[String]) -> String {
+    let cats = categories
+        .iter()
+        .map(|c| encode_category(c))
+        .collect::<Vec<_>>()
+        .join("+");
+    format!("https://rss.arxiv.org/rss/{cats}")
+}
+
+/// Announce type of an RSS item, from `<arxiv:announce_type>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnounceType {
+    /// New to arXiv ("new").
+    New,
+    /// Cross-listed into this category ("cross").
+    Cross,
+    /// Updated version of an existing paper ("replace", "replace-cross").
+    Replace,
+}
+
+impl AnnounceType {
+    /// Parses the announce type value; anything unknown counts as a
+    /// replacement so we never surface stale papers as new.
+    fn parse(value: &str) -> Self {
+        match normalise_ws(value).as_str() {
+            "new" => AnnounceType::New,
+            "cross" => AnnounceType::Cross,
+            _ => AnnounceType::Replace,
+        }
+    }
+
+    /// Whether the item should go into the daily fetch.
+    fn is_listable(&self) -> bool {
+        matches!(self, AnnounceType::New | AnnounceType::Cross)
+    }
+}
+
+/// The interesting parts of one RSS item description.
+struct RssDescription {
+    announce_type: AnnounceType,
+    /// The abstract text with the prefix stripped (owned, since the prefix
+    /// stripping may allocate).
+    abstract_text: String,
+}
+
+/// Splits an arXiv RSS `<description>` of the documented form
+/// `arXiv:<id> Announce Type: <type>\nAbstract: <text>` into the announce
+/// type and the abstract text. Returns `None` if the shape is not
+/// recognised (the item is then skipped rather than mis-parsed).
+fn split_rss_description(description: &str) -> Option<RssDescription> {
+    // feed-rs decodes HTML entities, but the raw feed sometimes still has
+    // stray markup; strip it defensively before matching the prefix.
+    let text = strip_html_tags(description);
+    let after_arxiv_id = text.split_once(" Announce Type: ")?;
+    let (rest, abstract_text) = after_arxiv_id
+        .1
+        .split_once("\nAbstract: ")
+        .or_else(|| after_arxiv_id.1.split_once(" Abstract: "))?;
+    if rest.contains('\n') || rest.is_empty() {
+        return None;
+    }
+    Some(RssDescription {
+        announce_type: AnnounceType::parse(rest),
+        abstract_text: abstract_text.trim().to_string(),
+    })
+}
+
+/// Removes `<...>` tags and collapses whitespace.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    normalise_ws(&out)
+}
+
+/// Converts one parsed RSS item into a [`Paper`] with the announce type.
+///
+/// The id comes from the guid (`oai:arXiv.org:<id>`, falling back to the
+/// link); the abs URL is always rebuilt as canonical HTTPS from that id.
+fn rss_entry_to_paper(entry: &feed_rs::model::Entry) -> Option<(Paper, AnnounceType)> {
+    let description = entry.summary.as_ref()?;
+    let parsed = split_rss_description(&description.content)?;
+
+    // guid is "oai:arXiv.org:2501.00001v1"; fall back to the item link.
+    let raw_id = entry
+        .id
+        .strip_prefix("oai:arXiv.org:")
+        .unwrap_or(&entry.id)
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let raw_id = raw_id.trim();
+    if raw_id.is_empty() {
+        return None;
+    }
+
+    let title = normalise_ws(&entry.title.as_ref()?.content);
+    if title.is_empty() {
+        return None;
+    }
+    let summary = normalise_ws(&parsed.abstract_text);
+    if summary.is_empty() {
+        return None;
+    }
+
+    // Canonical https abs page (version-less), derived from the id rather
+    // than trusting the link, which may be http or versioned.
+    let url = format!("https://arxiv.org/abs/{}", strip_version_suffix(raw_id));
+
+    let mut categories: Vec<String> = Vec::new();
+    for category in &entry.categories {
+        if !categories.contains(&category.term) {
+            categories.push(category.term.clone());
+        }
+    }
+
+    // dc:creator lists authors comma-separated; feed-rs puts each author
+    // element in `authors` (one per item).
+    let mut authors = Vec::new();
+    for person in &entry.authors {
+        let names = person.name.as_deref().unwrap_or("");
+        for name in names.split(',') {
+            let name = name.trim();
+            if !name.is_empty() && !authors.iter().any(|a| a == name) {
+                authors.push(name.to_string());
+            }
+        }
+    }
+
+    Some((
+        Paper {
+            id: raw_id.to_string(),
+            url,
+            title,
+            summary,
+            authors,
+            primary_category: categories.first().cloned(),
+            categories,
+            published: entry.published,
+        },
+        parsed.announce_type,
+    ))
+}
+
+/// Parses an arXiv daily RSS 2.0 feed body into the papers announced today,
+/// keeping only "new" and "cross" listings (replacements are updated old
+/// papers, not today's arrivals). Pure function.
+pub fn parse_rss_feed(body: &str) -> Result<Vec<Paper>, ArxivError> {
+    let feed = feed_rs::parser::parse(body.as_bytes())?;
+    Ok(feed
+        .entries
+        .iter()
+        .filter_map(rss_entry_to_paper)
+        .filter(|(_, t)| t.is_listable())
+        .map(|(paper, _)| paper)
+        .collect())
+}
+
+/// Fetches today's announced papers for the given categories from the arXiv
+/// daily RSS feed: one request, no paging.
+pub async fn fetch_today(
+    fetcher: &dyn FeedFetcher,
+    limiter: &RateLimiter,
+    categories: &[String],
+) -> Result<Vec<Paper>, ArxivError> {
+    let url = build_rss_url(categories);
+    limiter.wait().await;
+    let body = fetcher.fetch(&url).await?;
+    let papers = parse_rss_feed(&body)?;
+    tracing::debug!(count = papers.len(), "fetched today's arXiv papers via RSS");
+    Ok(papers)
+}
+
 /// Abstracts one HTTP GET of a feed body, for faking in tests.
 #[async_trait::async_trait]
 pub trait FeedFetcher: Send + Sync {
@@ -305,13 +490,15 @@ impl RateLimiter {
     }
 }
 
-/// Fetches every paper in the given categories submitted within `window`
-/// before `now`, paging through the arXiv Atom API.
+/// Fetches papers in the given categories submitted within `window` before
+/// `now`, paging through the arXiv Atom search API by query.
 ///
 /// Requests pages of [`PAGE_SIZE`] results via `start` / `max_results`,
 /// waiting on `limiter` between pages (arXiv etiquette: >= 3s), and stops
 /// at the first empty page. Never returns more than [`MAX_PAPERS`] papers.
-pub async fn fetch_recent(
+/// Note: the search API only contains papers after they are announced, so
+/// for daily digests prefer [`fetch_today`]; this is for query/id lookups.
+pub async fn fetch_by_query(
     fetcher: &dyn FeedFetcher,
     limiter: &RateLimiter,
     categories: &[String],
@@ -628,6 +815,95 @@ mod tests {
     }
 
     #[test]
+    fn parses_fixture_rss_feed_keeping_only_new_and_cross() {
+        let xml = std::fs::read_to_string(fixture_path("sample_rss_feed.xml"))
+            .expect("fixture must exist");
+        let papers = parse_rss_feed(&xml).expect("fixture must parse");
+
+        // "replace" is dropped: only the new and cross listings remain.
+        assert_eq!(papers.len(), 2, "only new + cross items are kept");
+        assert!(
+            !papers.iter().any(|p| p.id.starts_with("2501.00003")),
+            "replaced paper must be skipped"
+        );
+
+        let p = &papers[0];
+        assert_eq!(p.id, "2501.00001v1");
+        assert_eq!(p.id_no_version(), "2501.00001");
+        assert_eq!(p.url, "https://arxiv.org/abs/2501.00001");
+        assert_eq!(
+            p.title,
+            "Faster Speculative Decoding for Low-Resource Languages"
+        );
+        // The "arXiv:<id> Announce Type: ... Abstract:" prefix is stripped.
+        assert!(
+            p.summary.starts_with("We speed up inference"),
+            "{}",
+            p.summary
+        );
+        assert!(!p.summary.contains("Announce Type"));
+        assert!(!p.summary.contains("Abstract:"));
+        assert_eq!(p.authors, vec!["Asha Rao", "Dev Patel"]);
+        assert_eq!(p.primary_category.as_deref(), Some("cs.CL"));
+        assert_eq!(p.categories, vec!["cs.CL", "cs.AI"]);
+        assert!(p.published.is_some());
+
+        let q = &papers[1];
+        assert_eq!(q.id, "2501.00002v1");
+        assert_eq!(q.url, "https://arxiv.org/abs/2501.00002");
+        assert_eq!(q.authors, vec!["Mei Lin"]);
+        assert!(q.summary.starts_with("We prune KV cache"));
+    }
+
+    #[test]
+    fn build_rss_url_lists_categories_on_the_rss_host() {
+        let url = build_rss_url(&["cs.CL".to_string(), "cs.LG".to_string()]);
+        assert_eq!(url, "https://rss.arxiv.org/rss/cs.CL+cs.LG");
+        check_url_allowed(&url).expect("RSS URL must be allowed");
+    }
+
+    #[tokio::test]
+    async fn fetch_today_makes_one_request_and_parses_items() {
+        let xml = std::fs::read_to_string(fixture_path("sample_rss_feed.xml"))
+            .expect("fixture must exist");
+        let fetcher = FakeFetcher::new(vec![("https://rss.arxiv.org/rss/".to_string(), xml)]);
+        let limiter = RateLimiter::new(Duration::ZERO);
+
+        let papers = fetch_today(
+            &fetcher,
+            &limiter,
+            &["cs.CL".to_string(), "cs.LG".to_string()],
+        )
+        .await
+        .expect("fetch should succeed");
+
+        assert_eq!(
+            papers.len(),
+            2,
+            "new + cross items survive, replace is dropped"
+        );
+        let requested = fetcher.requested.lock().await.clone();
+        assert_eq!(requested.len(), 1, "exactly one request, no paging");
+        assert_eq!(
+            requested[0], "https://rss.arxiv.org/rss/cs.CL+cs.LG",
+            "unexpected URL: {}",
+            requested[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn rss_url_is_rejected_when_host_not_allowed() {
+        // The allowlist gate is enforced before any request: a feed URL on a
+        // foreign host never reaches the fetcher.
+        let err = check_url_allowed("https://evil.example.com/rss/cs.CL")
+            .expect_err("foreign host must be rejected");
+        assert!(
+            matches!(err, ArxivError::HostNotAllowed(ref host) if host == "evil.example.com"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn build_query_url_targets_arxiv_window_and_categories() {
         let from = Utc.with_ymd_and_hms(2025, 1, 1, 9, 30, 0).unwrap();
         let to = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
@@ -654,7 +930,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_recent_stops_on_first_empty_page() {
+    async fn fetch_by_query_stops_on_first_empty_page() {
         // Page 0 serves the two-entry fixture; every later page is empty.
         let page_one =
             std::fs::read_to_string(fixture_path("sample_feed.xml")).expect("fixture must exist");
@@ -666,7 +942,7 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
         let started = std::time::Instant::now();
 
-        let papers = fetch_recent(
+        let papers = fetch_by_query(
             &fetcher,
             &limiter,
             &["cs.CL".to_string()],
@@ -704,13 +980,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_recent_hard_caps_at_max_papers() {
+    async fn fetch_by_query_hard_caps_at_max_papers() {
         // Every page comes back full, so only the cap ends the run.
         let fetcher = FakeFetcher::new(vec![(String::new(), feed_with_n_entries(PAGE_SIZE))]);
         let limiter = RateLimiter::new(Duration::ZERO);
         let now = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
 
-        let papers = fetch_recent(
+        let papers = fetch_by_query(
             &fetcher,
             &limiter,
             &["cs.CL".to_string()],
