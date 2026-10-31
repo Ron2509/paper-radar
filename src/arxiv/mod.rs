@@ -1,11 +1,15 @@
 //! arXiv fetching and parsing.
 //!
-//! Fetches the arXiv Atom feed for the configured categories, enforces the
-//! network allowlist (HTTPS only, `export.arxiv.org` / `arxiv.org`), rate
-//! limits requests to at least one every 3 seconds per arXiv etiquette, and
-//! parses entries into [`Paper`] structs. Feed parsing is pure and unit
-//! tested against a saved fixture; HTTP goes through the [`FeedFetcher`]
-//! trait so tests never touch the real arXiv.
+//! Queries the arXiv Atom feed for the configured categories, restricted
+//! with a `submittedDate` range to papers submitted within a recent window
+//! (default 48 hours), and pages through the results with `start` /
+//! `max_results` until an empty page (hard cap [`MAX_PAPERS`]). The network
+//! allowlist (HTTPS only, `export.arxiv.org` / `arxiv.org`) is enforced on
+//! every request and on every redirect hop, requests are rate limited to at
+//! least one every 3 seconds per arXiv etiquette, and entries are parsed
+//! into [`Paper`] structs. Feed parsing is pure and unit tested against a
+//! saved fixture; HTTP goes through the [`FeedFetcher`] trait so tests
+//! never touch the real arXiv.
 
 // TODO(wiring): remove once `main` starts using this module; until then
 // these types are only consumed by tests.
@@ -27,6 +31,12 @@ const MAX_BODY_BYTES: usize = 5 * 1024 * 1024;
 
 /// Maximum redirects followed (each re-checked against the allowlist).
 const MAX_REDIRECTS: usize = 3;
+
+/// Results requested per page (`max_results`).
+pub const PAGE_SIZE: usize = 200;
+
+/// Hard cap on the number of papers one fetch run may return.
+pub const MAX_PAPERS: usize = 2000;
 
 /// Minimum spacing between arXiv requests (arXiv etiquette asks for >= 3s).
 pub const MIN_REQUEST_INTERVAL: Duration = Duration::from_secs(3);
@@ -50,15 +60,9 @@ pub enum ArxivError {
     /// The response body was not a parseable Atom feed.
     #[error("failed to parse arXiv feed: {0}")]
     Parse(#[from] feed_rs::parser::ParseFeedError),
-}
-
-impl From<reqwest::Error> for ArxivError {
-    fn from(e: reqwest::Error) -> Self {
-        ArxivError::Request {
-            url: e.url().map(|u| u.as_str().to_string()).unwrap_or_default(),
-            message: e.to_string(),
-        }
-    }
+    /// The requested submission window cannot be represented.
+    #[error("invalid fetch window: {0}")]
+    InvalidWindow(String),
 }
 
 /// One arXiv paper as extracted from the Atom feed.
@@ -123,20 +127,40 @@ fn encode_category(term: &str) -> String {
     out
 }
 
-/// Builds the arXiv Atom query URL for the given categories, sorted by
-/// submission date (newest first).
-pub fn build_query_url(categories: &[String]) -> String {
-    // Built by hand: arXiv expects literal `+` as the space between
-    // OR-grouped terms, which `Url::parse_with_params` would encode as %2B.
+/// Builds the arXiv Atom query URL for papers in the given categories
+/// submitted between `from` and `to` (inclusive), sorted newest first,
+/// returning the page starting at `start` (0-based) of up to `max_results`
+/// entries.
+///
+/// The date filter uses the arXiv API's documented syntax
+/// `submittedDate:[YYYYMMDDHHMM TO YYYYMMDDHHMM]` with GMT times to the
+/// minute. The URL is built by hand because arXiv expects a literal `+` as
+/// the space both between OR-grouped terms and around `TO`, which
+/// `Url::parse_with_params` would encode as `%2B`.
+pub fn build_query_url(
+    categories: &[String],
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+    start: usize,
+    max_results: usize,
+) -> String {
     let cats = categories
         .iter()
         .map(|c| format!("cat:{}", encode_category(c)))
         .collect::<Vec<_>>()
         .join("+OR+");
     format!(
-        "https://export.arxiv.org/api/query?search_query={cats}\
-         &sortBy=submittedDate&sortOrder=descending&max_results=100"
+        "https://export.arxiv.org/api/query?search_query=\
+         submittedDate:[{}+TO+{}]+AND+({cats})\
+         &sortBy=submittedDate&sortOrder=descending&start={start}&max_results={max_results}",
+        format_gmt(from),
+        format_gmt(to),
     )
+}
+
+/// Formats a timestamp as arXiv's `YYYYMMDDHHMM` (GMT, to the minute).
+fn format_gmt(t: DateTime<Utc>) -> String {
+    t.format("%Y%m%d%H%M").to_string()
 }
 
 /// Validates that a URL is HTTPS and its host is on the allowlist.
@@ -150,6 +174,30 @@ pub fn check_url_allowed(url_str: &str) -> Result<Url, ArxivError> {
         Ok(url)
     } else {
         Err(host_not_allowed_error(host))
+    }
+}
+
+/// What to do with one redirect hop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RedirectDecision {
+    /// The hop stays on an allowed HTTPS host; keep following.
+    Follow,
+    /// Refuse the hop, surfacing this message as an error.
+    Reject(&'static str),
+}
+
+/// Decides whether a redirect hop to `url` is acceptable, given the URLs
+/// visited so far (which includes the original request URL, like reqwest's
+/// `Attempt::previous`). Shared by the real client's redirect policy and by
+/// the fake fetcher's redirect simulation in tests.
+fn redirect_decision(url: &Url, previous: &[Url]) -> RedirectDecision {
+    if previous.len() > MAX_REDIRECTS {
+        RedirectDecision::Reject("too many redirects")
+    } else if url.scheme() == "https" && url.host_str().is_some_and(|h| ALLOWED_HOSTS.contains(&h))
+    {
+        RedirectDecision::Follow
+    } else {
+        RedirectDecision::Reject("redirect to disallowed host")
     }
 }
 
@@ -257,6 +305,49 @@ impl RateLimiter {
     }
 }
 
+/// Fetches every paper in the given categories submitted within `window`
+/// before `now`, paging through the arXiv Atom API.
+///
+/// Requests pages of [`PAGE_SIZE`] results via `start` / `max_results`,
+/// waiting on `limiter` between pages (arXiv etiquette: >= 3s), and stops
+/// at the first empty page. Never returns more than [`MAX_PAPERS`] papers.
+pub async fn fetch_recent(
+    fetcher: &dyn FeedFetcher,
+    limiter: &RateLimiter,
+    categories: &[String],
+    now: DateTime<Utc>,
+    window: Duration,
+) -> Result<Vec<Paper>, ArxivError> {
+    let window =
+        chrono::Duration::from_std(window).map_err(|e| ArxivError::InvalidWindow(e.to_string()))?;
+    let from = now
+        .checked_sub_signed(window)
+        .ok_or_else(|| ArxivError::InvalidWindow("window start is out of range".to_string()))?;
+
+    let mut papers: Vec<Paper> = Vec::new();
+    let mut start = 0usize;
+    while papers.len() < MAX_PAPERS {
+        limiter.wait().await;
+        let url = build_query_url(categories, from, now, start, PAGE_SIZE);
+        let body = fetcher.fetch(&url).await?;
+        let page = parse_atom_feed(&body)?;
+        tracing::debug!(
+            start,
+            got = page.len(),
+            total = papers.len(),
+            "fetched arXiv page"
+        );
+        if page.is_empty() {
+            break;
+        }
+        papers.extend(page);
+        start += PAGE_SIZE;
+    }
+    papers.truncate(MAX_PAPERS);
+    tracing::debug!(count = papers.len(), "arXiv fetch complete");
+    Ok(papers)
+}
+
 /// Real HTTP fetcher built on reqwest.
 pub struct ReqwestFetcher {
     client: reqwest::Client,
@@ -266,30 +357,24 @@ impl ReqwestFetcher {
     /// Creates a fetcher with the given contact email for the User-Agent.
     pub fn new(contact_email: &str) -> Result<Self, ArxivError> {
         // At most MAX_REDIRECTS hops; every hop must stay on HTTPS and on an
-        // allowed host. `previous()` includes the original URL, so a chain of
-        // N redirects has N+1 entries there.
+        // allowed host, otherwise the request fails loudly instead of
+        // silently stopping at an off-allowlist response.
         let policy = redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() > MAX_REDIRECTS {
-                attempt.error("too many redirects")
-            } else if attempt
-                .url()
-                .host_str()
-                .is_some_and(|h| ALLOWED_HOSTS.contains(&h))
-                && attempt.url().scheme() == "https"
-            {
-                attempt.follow()
-            } else {
-                attempt.stop()
+            match redirect_decision(attempt.url(), attempt.previous()) {
+                RedirectDecision::Follow => attempt.follow(),
+                RedirectDecision::Reject(message) => attempt.error(message),
             }
         });
         let client = reqwest::Client::builder()
             .redirect(policy)
             .timeout(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(10))
-            .user_agent(format!(
-                "paper-radar/0.1.0 (https://github.com/soketlabs/paper-radar; mailto:{contact_email})"
-            ))
-            .build()?;
+            .user_agent(format!("paper-radar/0.1.0 (mailto:{contact_email})"))
+            .build()
+            .map_err(|e| ArxivError::Request {
+                url: "client build".to_string(),
+                message: e.to_string(),
+            })?;
         Ok(Self { client })
     }
 }
@@ -302,7 +387,8 @@ impl FeedFetcher for ReqwestFetcher {
             .client
             .get(url)
             .send()
-            .await?
+            .await
+            .map_err(|e| request_error(url_str, &e))?
             .error_for_status()
             .map_err(|e| ArxivError::Request {
                 url: url_str.to_string(),
@@ -316,7 +402,11 @@ impl FeedFetcher for ReqwestFetcher {
             }
         }
         let mut body: Vec<u8> = Vec::with_capacity(4096);
-        while let Some(chunk) = response.chunk().await? {
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| request_error(url_str, &e))?
+        {
             body.extend_from_slice(&chunk);
             if body.len() > MAX_BODY_BYTES {
                 return Err(too_large_error(url_str));
@@ -326,6 +416,15 @@ impl FeedFetcher for ReqwestFetcher {
             url: url_str.to_string(),
             message: "response body is not valid UTF-8".to_string(),
         })
+    }
+}
+
+/// Maps a transport-level reqwest error (network, timeout, redirect policy,
+/// ...) onto [`ArxivError::Request`], keeping the offending URL.
+fn request_error(url_str: &str, e: &reqwest::Error) -> ArxivError {
+    ArxivError::Request {
+        url: url_str.to_string(),
+        message: e.to_string(),
     }
 }
 
@@ -348,11 +447,18 @@ pub(crate) fn fixture_path(name: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone as _;
 
     /// A fetcher that never performs I/O: it checks the URL against the same
-    /// allowlist logic and returns a canned body.
+    /// allowlist logic, simulates redirects through the same policy the real
+    /// client uses, and returns a canned body.
     struct FakeFetcher {
+        /// (needle, body): first entry whose needle is contained in the URL
+        /// wins; an empty needle matches everything.
         bodies: Vec<(String, String)>,
+        /// (needle, location): if the URL contains needle, respond with a
+        /// redirect to `location` instead of a body.
+        redirects: Vec<(String, String)>,
         requested: Mutex<Vec<String>>,
     }
 
@@ -360,26 +466,98 @@ mod tests {
         fn new(bodies: Vec<(String, String)>) -> Self {
             Self {
                 bodies,
+                redirects: Vec::new(),
                 requested: Mutex::new(Vec::new()),
             }
+        }
+
+        fn with_redirects(mut self, redirects: Vec<(String, String)>) -> Self {
+            self.redirects = redirects;
+            self
+        }
+
+        fn redirect_for(&self, url: &Url) -> Option<String> {
+            self.redirects
+                .iter()
+                .find(|(needle, _)| url.as_str().contains(needle))
+                .map(|(_, location)| location.clone())
         }
     }
 
     #[async_trait::async_trait]
     impl FeedFetcher for FakeFetcher {
         async fn fetch(&self, url: &str) -> Result<String, ArxivError> {
-            check_url_allowed(url)?;
-            self.requested.lock().await.push(url.to_string());
-            for (prefix, body) in &self.bodies {
-                if url.starts_with(prefix) {
-                    return Ok(body.clone());
+            let mut current = check_url_allowed(url)?;
+            self.requested.lock().await.push(current.to_string());
+            loop {
+                if let Some(location) = self.redirect_for(&current) {
+                    // Same rules as the real client: every hop must stay on
+                    // an allowed HTTPS host, within the redirect budget.
+                    let next = Url::parse(&location).map_err(|source| ArxivError::InvalidUrl {
+                        url: location.clone(),
+                        source,
+                    })?;
+                    let visited: Vec<Url> = self
+                        .requested
+                        .lock()
+                        .await
+                        .iter()
+                        .filter_map(|u| Url::parse(u).ok())
+                        .collect();
+                    match redirect_decision(&next, &visited) {
+                        RedirectDecision::Follow => {
+                            current = next;
+                            self.requested.lock().await.push(current.to_string());
+                        }
+                        RedirectDecision::Reject(message) => {
+                            return Err(ArxivError::Request {
+                                url: next.to_string(),
+                                message: message.to_string(),
+                            });
+                        }
+                    }
+                } else {
+                    for (needle, body) in &self.bodies {
+                        if current.as_str().contains(needle.as_str()) {
+                            return Ok(body.clone());
+                        }
+                    }
+                    return Err(ArxivError::Request {
+                        url: current.to_string(),
+                        message: "no canned body".to_string(),
+                    });
                 }
             }
-            Err(ArxivError::Request {
-                url: url.to_string(),
-                message: "no canned body".to_string(),
-            })
         }
+    }
+
+    /// A minimal Atom feed with no entries (what arXiv returns past the end
+    /// of a result set).
+    fn empty_feed_xml() -> &'static str {
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"></feed>"#
+    }
+
+    /// One valid Atom entry for the given arXiv id.
+    fn entry_xml(id: &str) -> String {
+        format!(
+            "<entry><id>http://arxiv.org/abs/{id}</id>\
+             <updated>2025-01-02T09:30:00Z</updated>\
+             <published>2025-01-02T09:30:00Z</published>\
+             <title>Paper {id}</title><summary>Abstract of paper {id}.</summary>\
+             <author><name>A. Author</name></author></entry>"
+        )
+    }
+
+    /// An Atom feed with `n` entries.
+    fn feed_with_n_entries(n: usize) -> String {
+        let entries: String = (0..n)
+            .map(|i| entry_xml(&format!("2501.{i:05}v1")))
+            .collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">{entries}</feed>"#
+        )
     }
 
     #[tokio::test]
@@ -450,16 +628,176 @@ mod tests {
     }
 
     #[test]
-    fn build_query_url_targets_arxiv_with_categories() {
-        let url = build_query_url(&["cs.CL".to_string(), "cs.LG".to_string()]);
+    fn build_query_url_targets_arxiv_window_and_categories() {
+        let from = Utc.with_ymd_and_hms(2025, 1, 1, 9, 30, 0).unwrap();
+        let to = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
+        let url = build_query_url(
+            &["cs.CL".to_string(), "cs.LG".to_string()],
+            from,
+            to,
+            200,
+            200,
+        );
         assert!(url.starts_with("https://export.arxiv.org/api/query?"));
-        // arXiv's documented query form: search_query=cat:cs.CL+OR+cat:cs.LG
-        assert!(url.contains("search_query=cat:cs.CL+OR+cat:cs.LG&"));
+        // arXiv's documented date-range syntax (GMT, to the minute) ANDed
+        // with the category group, plus paging parameters.
+        assert!(url.contains(
+            "search_query=submittedDate:[202501010930+TO+202501030930]\
+             +AND+(cat:cs.CL+OR+cat:cs.LG)&"
+        ));
         assert!(url.contains("sortBy=submittedDate"));
         assert!(url.contains("sortOrder=descending"));
+        assert!(url.contains("&start=200&max_results=200"));
 
         // The produced URL must itself pass the allowlist check.
         check_url_allowed(&url).expect("query URL must be allowed");
+    }
+
+    #[tokio::test]
+    async fn fetch_recent_stops_on_first_empty_page() {
+        // Page 0 serves the two-entry fixture; every later page is empty.
+        let page_one =
+            std::fs::read_to_string(fixture_path("sample_feed.xml")).expect("fixture must exist");
+        let fetcher = FakeFetcher::new(vec![
+            ("&start=0&".to_string(), page_one),
+            (String::new(), empty_feed_xml().to_string()),
+        ]);
+        let limiter = RateLimiter::new(Duration::from_millis(40));
+        let now = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
+        let started = std::time::Instant::now();
+
+        let papers = fetch_recent(
+            &fetcher,
+            &limiter,
+            &["cs.CL".to_string()],
+            now,
+            Duration::from_secs(48 * 3600),
+        )
+        .await
+        .expect("fetch should succeed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(papers.len(), 2, "both fixture papers are returned");
+        let requested = fetcher.requested.lock().await.clone();
+        assert_eq!(
+            requested.len(),
+            2,
+            "paging must stop at the first empty page, requested: {requested:?}"
+        );
+        assert!(requested[0].contains("&start=0&"), "{}", requested[0]);
+        assert!(
+            requested[1].contains("&start=200&"),
+            "second page starts one PAGE_SIZE further: {}",
+            requested[1]
+        );
+        // The window is the 48h before `now`, in arXiv's GMT syntax.
+        assert!(
+            requested[0].contains("submittedDate:[202501010930+TO+202501030930]+AND+(cat:cs.CL)&"),
+            "unexpected first query: {}",
+            requested[0]
+        );
+        // Pages go through the rate limiter: the second request had to wait.
+        assert!(
+            elapsed >= Duration::from_millis(35),
+            "pages must be spaced by the rate limiter, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_recent_hard_caps_at_max_papers() {
+        // Every page comes back full, so only the cap ends the run.
+        let fetcher = FakeFetcher::new(vec![(String::new(), feed_with_n_entries(PAGE_SIZE))]);
+        let limiter = RateLimiter::new(Duration::ZERO);
+        let now = Utc.with_ymd_and_hms(2025, 1, 3, 9, 30, 0).unwrap();
+
+        let papers = fetch_recent(
+            &fetcher,
+            &limiter,
+            &["cs.CL".to_string()],
+            now,
+            Duration::from_secs(48 * 3600),
+        )
+        .await
+        .expect("fetch should succeed");
+
+        assert_eq!(papers.len(), MAX_PAPERS, "result is capped");
+        let requested = fetcher.requested.lock().await.clone();
+        assert_eq!(
+            requested.len(),
+            MAX_PAPERS / PAGE_SIZE,
+            "one request per full page, no more: {requested:?}"
+        );
+        assert!(
+            !requested.iter().any(|u| u.contains("&start=2000&")),
+            "must not page past the cap: {requested:?}"
+        );
+        assert!(requested[0].contains("&start=0&"));
+        assert!(
+            requested.last().is_some_and(|u| u.contains("&start=1800&")),
+            "last page starts just below the cap: {requested:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_to_disallowed_host_or_plain_http_is_an_error() {
+        // Hop to a host outside the allowlist.
+        let fetcher = FakeFetcher::new(vec![]).with_redirects(vec![(
+            "export.arxiv.org/api/query".to_string(),
+            "https://evil.example.com/feed".to_string(),
+        )]);
+        let err = fetcher
+            .fetch("https://export.arxiv.org/api/query?search_query=cat:cs.CL")
+            .await
+            .expect_err("redirect off the allowlist must fail loudly");
+        assert!(
+            matches!(err, ArxivError::Request { .. }),
+            "should surface as a request error: {err}"
+        );
+        assert!(
+            err.to_string().contains("redirect to disallowed host"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            fetcher.requested.lock().await.len(),
+            1,
+            "the disallowed hop is never fetched"
+        );
+
+        // Hop to an allowed host but over plain HTTP.
+        let fetcher = FakeFetcher::new(vec![]).with_redirects(vec![(
+            "export.arxiv.org/api/query".to_string(),
+            "http://arxiv.org/api/query".to_string(),
+        )]);
+        let err = fetcher
+            .fetch("https://export.arxiv.org/api/query?search_query=cat:cs.CL")
+            .await
+            .expect_err("plain HTTP redirect must be rejected");
+        assert!(
+            err.to_string().contains("redirect to disallowed host"),
+            "non-HTTPS hop must be refused: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_to_allowed_https_host_is_followed() {
+        let fetcher = FakeFetcher::new(vec![(
+            "arxiv.org/api/query".to_string(),
+            "<feed/>".to_string(),
+        )])
+        .with_redirects(vec![(
+            "export.arxiv.org/api/query".to_string(),
+            "https://arxiv.org/api/query?moved=1".to_string(),
+        )]);
+
+        let body = fetcher
+            .fetch("https://export.arxiv.org/api/query?search_query=cat:cs.CL")
+            .await
+            .expect("redirect to an allowed HTTPS host should be followed");
+
+        assert_eq!(body, "<feed/>");
+        let requested = fetcher.requested.lock().await.clone();
+        assert_eq!(requested.len(), 2, "original request plus one hop");
+        assert!(requested[1].contains("arxiv.org/api/query?moved=1"));
     }
 
     #[tokio::test]
