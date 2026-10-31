@@ -81,6 +81,16 @@ Applies to every paper source (arXiv now, others later).
   parse it strictly, and validate: every returned paper id must be one we sent.
   Retry once on bad output, then skip that batch and log it.
 
+- GLM-5.3 always reasons before answering, and reasoning counts toward the
+  output limit. Loop defaults the limit to the model list's `maxTokens`
+  (16,384) when none is set; the Soket API accepts higher values. Set the
+  model's `max_tokens` to 32,768 before passing it to the harness. A reply can
+  still end with stop reason `length` and an empty answer. Treat that as a
+  failure: log it, retry once with a smaller input (fewer papers per batch,
+  shorter paper text), then skip.
+  Keep each LLM call small (e.g. ranking batches of ~15 abstracts). Do not
+  send `reasoning_effort` or thinking flags: the Soket API rejects them (400).
+
 ## Security rules (mandatory)
 
 1. Secrets: `SOKET_API_KEY`, `SLACK_BOT_TOKEN` (xoxb-), `SLACK_APP_TOKEN`
