@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <link href="http://arxiv.org/api/query?search_query%3Dcat:cs.CL" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: search_query=cat:cs.CL</title>
+  <id>http://arxiv.org/api/cHxbiOdZaJ56NDgAff3t5WxST7M</id>
+  <updated>2025-01-02T00:00:00-05:00</updated>
+  <opensearch:totalResults xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">2</opensearch:totalResults>
+  <opensearch:startIndex xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">0</opensearch:startIndex>
+  <opensearch:itemsPerPage xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">100</opensearch:itemsPerPage>
+
+  <entry>
+    <id>http://arxiv.org/abs/2501.00001v1</id>
+    <updated>2025-01-01T18:00:00Z</updated>
+    <published>2025-01-01T18:00:00Z</published>
+    <title>Speculative Decoding for  Low-Resource
+      Languages</title>
+    <summary>We speed up inference for Indic languages by drafting with a small
+      multilingual model.  Our method keeps generation quality while cutting
+      latency by 40%.&lt;/p&gt;</summary>
+    <author>
+      <name>Asha Rao</name>
+    </author>
+    <author>
+      <name>Dev Patel</name>
+    </author>
+    <arxiv:comment xmlns:arxiv="http://arxiv.org/schemas/atom">8 pages</arxiv:comment>
+    <link href="http://arxiv.org/abs/2501.00001v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2501.00001v1" rel="related" type="application/pdf"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+
+  <entry>
+    <id>http://arxiv.org/abs/2501.00002v1</id>
+    <updated>2025-01-02T09:30:00Z</updated>
+    <published>2025-01-02T09:30:00Z</published>
+    <title>KV Cache Compression via Structured Pruning</title>
+    <summary>We prune KV cache entries along attention heads, reducing memory
+      during batched serving without quality loss.</summary>
+    <author>
+      <name>Mei Lin</name>
+    </author>
+    <link href="http://arxiv.org/abs/2501.00002v1" rel="alternate" type="text/html"/>
+    <arxiv:primary_category xmlns:arxiv="http://arxiv.org/schemas/atom" term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.DC" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+</feed>

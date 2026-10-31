@@ -1,3 +1,4 @@
+mod arxiv;
 mod config;
 mod secrets;
 
