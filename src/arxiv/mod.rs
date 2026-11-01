@@ -63,6 +63,15 @@ pub enum ArxivError {
     /// The response body was not a parseable Atom feed.
     #[error("failed to parse arXiv feed: {0}")]
     Parse(#[from] feed_rs::parser::ParseFeedError),
+    /// The feed parsed as XML and contained items, but none of them matched
+    /// the expected arXiv daily-listing shape (e.g. arXiv changed the RSS
+    /// layout). An empty feed, or one holding only replacements, is not
+    /// this error.
+    #[error(
+        "arXiv feed format was not recognised: {items} items found but none \
+         could be parsed as an arXiv daily listing"
+    )]
+    UnrecognisedFeedFormat { items: usize },
     /// The requested submission window cannot be represented.
     #[error("invalid fetch window: {0}")]
     InvalidWindow(String),
@@ -423,15 +432,33 @@ fn rss_entry_to_paper(entry: &feed_rs::model::Entry) -> Option<(Paper, AnnounceT
 /// Parses an arXiv daily RSS 2.0 feed body into the papers announced today,
 /// keeping only "new" and "cross" listings (replacements are updated old
 /// papers, not today's arrivals). Pure function.
+///
+/// An empty feed is fine (nothing was announced). A feed with items where
+/// none parse — e.g. arXiv changed the description layout — is an error:
+/// silently returning nothing would look like "no papers today" when really
+/// we stopped understanding the feed. Items that parse but are filtered out
+/// as replacements do not count as unparseable.
 pub fn parse_rss_feed(body: &str) -> Result<Vec<Paper>, ArxivError> {
     let feed = feed_rs::parser::parse(body.as_bytes())?;
-    Ok(feed
-        .entries
-        .iter()
-        .filter_map(rss_entry_to_paper)
-        .filter(|(_, t)| t.is_listable())
-        .map(|(paper, _)| paper)
-        .collect())
+    if feed.entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut any_parsed = false;
+    let mut papers = Vec::new();
+    for (paper, announce_type) in feed.entries.iter().filter_map(rss_entry_to_paper) {
+        any_parsed = true;
+        if announce_type.is_listable() {
+            papers.push(paper);
+        }
+    }
+
+    if !any_parsed {
+        return Err(ArxivError::UnrecognisedFeedFormat {
+            items: feed.entries.len(),
+        });
+    }
+    Ok(papers)
 }
 
 /// Fetches today's announced papers for the given categories from the arXiv
@@ -853,6 +880,69 @@ mod tests {
         assert_eq!(q.url, "https://arxiv.org/abs/2501.00002");
         assert_eq!(q.authors, vec!["Mei Lin"]);
         assert!(q.summary.starts_with("We prune KV cache"));
+    }
+
+    #[test]
+    fn unparseable_items_error_but_empty_or_replace_only_feeds_do_not() {
+        // Items exist but none match the expected description layout (e.g.
+        // arXiv changed the RSS format): this must be a loud error, not a
+        // silent "no papers today".
+        let unrecognised = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>cs.CL updates on arXiv.org</title>
+    <item>
+      <title>Some Paper</title>
+      <link>https://arxiv.org/abs/2501.00099</link>
+      <description>A description with no announce-type marker at all.</description>
+      <guid isPermaLink="false">oai:arXiv.org:2501.00099v1</guid>
+    </item>
+    <item>
+      <title>Another Paper</title>
+      <link>https://arxiv.org/abs/2501.00098</link>
+      <description>Also not the documented arXiv daily-listing shape.</description>
+      <guid isPermaLink="false">oai:arXiv.org:2501.00098v1</guid>
+    </item>
+  </channel>
+</rss>"#;
+        let err = parse_rss_feed(unrecognised).expect_err("unparseable items must be an error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("format was not recognised"),
+            "should say the format was not recognised: {msg}"
+        );
+        assert!(
+            msg.contains("2 items"),
+            "should report how many items were found: {msg}"
+        );
+
+        // A feed holding only replacements parses fine and yields nothing:
+        // those items were understood, just deliberately skipped.
+        let replace_only = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>cs.CL updates on arXiv.org</title>
+    <item>
+      <title>An Updated Paper</title>
+      <link>https://arxiv.org/abs/2501.00003</link>
+      <description>arXiv:2501.00003v2 Announce Type: replace
+Abstract: An updated version of an older paper.</description>
+      <guid isPermaLink="false">oai:arXiv.org:2501.00003v2</guid>
+    </item>
+  </channel>
+</rss>"#;
+        let papers = parse_rss_feed(replace_only).expect("replace-only feed is not a format error");
+        assert!(papers.is_empty(), "replacements are skipped, not kept");
+
+        // A feed with no items at all is simply a quiet day.
+        let empty = r#"<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>cs.CL updates on arXiv.org</title>
+  </channel>
+</rss>"#;
+        let papers = parse_rss_feed(empty).expect("empty feed is not an error");
+        assert!(papers.is_empty());
     }
 
     #[test]

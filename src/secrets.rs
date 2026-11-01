@@ -2,10 +2,13 @@
 //!
 //! Loads `SOKET_API_KEY`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from the
 //! environment, with an optional `.env` file applied first via dotenvy (real
-//! environment variables always win). Each value is wrapped in [`Secret`],
-//! whose `Debug` and `Display` print `[REDACTED]`, so a secret can never leak
-//! into logs or error messages. Call [`Secret::expose`] only at the exact
-//! place the real value is needed.
+//! environment variables always win). Loading is split so a command only
+//! requires what it actually uses: [`load_soket_key`] fetches just the Soket
+//! LLM API key (enough for scoring and dry runs), while [`SlackSecrets`]
+//! fetches the two Slack tokens needed to post or listen. Each value is
+//! wrapped in [`Secret`], whose `Debug` and `Display` print `[REDACTED]`, so
+//! a secret can never leak into logs or error messages. Call
+//! [`Secret::expose`] only at the exact place the real value is needed.
 
 // TODO(wiring): remove once `main` starts using secrets; until then these
 // types are only consumed by tests.
@@ -73,31 +76,44 @@ impl fmt::Display for Secret {
     }
 }
 
-/// All secrets paper-radar needs, loaded and validated.
-#[derive(Debug, Clone)]
-pub struct Secrets {
-    /// Key for the Soket LLM API.
-    pub soket_api_key: Secret,
-    /// Slack bot token (`xoxb-...`).
-    pub slack_bot_token: Secret,
-    /// Slack app token for Socket Mode (`xapp-...`).
-    pub slack_app_token: Secret,
+/// Loads the Soket API key from the process environment, applying `.env`
+/// first if present. A missing or unreadable `.env` is not an error as long
+/// as the variable comes from the shell. No Slack token is required.
+pub fn load_soket_key() -> Result<Secret, SecretsError> {
+    soket_key_from_lookup(env_lookup())
 }
 
-impl Secrets {
-    /// Loads secrets from the process environment, applying `.env` first if
-    /// present. A missing or unreadable `.env` is not an error as long as the
-    /// variables come from the shell.
+/// Loads the Soket API key from a lookup function instead of the real
+/// environment. Used by `load_soket_key` and by tests.
+pub fn soket_key_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Secret, SecretsError> {
+    Ok(Secret::new(require(&lookup, SOKET_API_KEY_VAR)?))
+}
+
+/// The two Slack tokens paper-radar needs, loaded and validated.
+///
+/// Only commands that talk to Slack (posting the digest, the Socket Mode
+/// listener) need these; fetching and dry runs run on the Soket key alone.
+#[derive(Debug, Clone)]
+pub struct SlackSecrets {
+    /// Slack bot token (`xoxb-...`).
+    pub bot_token: Secret,
+    /// Slack app token for Socket Mode (`xapp-...`).
+    pub app_token: Secret,
+}
+
+impl SlackSecrets {
+    /// Loads the Slack tokens from the process environment, applying `.env`
+    /// first if present. A missing or unreadable `.env` is not an error as
+    /// long as the variables come from the shell.
     pub fn load() -> Result<Self, SecretsError> {
-        let _ = dotenvy::dotenv();
-        Self::from_lookup(|name| std::env::var(name).ok())
+        Self::from_lookup(env_lookup())
     }
 
-    /// Loads secrets from a lookup function instead of the real environment.
-    /// Used by `load` and by tests.
+    /// Loads the Slack tokens from a lookup function instead of the real
+    /// environment. Used by `load` and by tests.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, SecretsError> {
-        let soket_api_key = Secret::new(require(&lookup, SOKET_API_KEY_VAR)?);
-
         let bot_token = require(&lookup, SLACK_BOT_TOKEN_VAR)?;
         ensure_prefix(SLACK_BOT_TOKEN_VAR, &bot_token, "xoxb-")?;
 
@@ -105,11 +121,17 @@ impl Secrets {
         ensure_prefix(SLACK_APP_TOKEN_VAR, &app_token, "xapp-")?;
 
         Ok(Self {
-            soket_api_key,
-            slack_bot_token: Secret::new(bot_token),
-            slack_app_token: Secret::new(app_token),
+            bot_token: Secret::new(bot_token),
+            app_token: Secret::new(app_token),
         })
     }
+}
+
+/// Applies `.env` if present, then looks variables up in the process
+/// environment (which wins over `.env`). Shared by both loaders.
+fn env_lookup() -> impl Fn(&str) -> Option<String> {
+    let _ = dotenvy::dotenv();
+    |name| std::env::var(name).ok()
 }
 
 /// Fetches a non-empty variable, trimming surrounding whitespace.
@@ -153,24 +175,35 @@ mod tests {
     }
 
     #[test]
+    fn soket_key_loads_without_slack_tokens() {
+        // Only the Soket key is set: loading it must succeed even though
+        // neither Slack token exists.
+        let vars = [(SOKET_API_KEY_VAR, "sk-test-soket-key")];
+        let key = soket_key_from_lookup(lookup_from(&vars))
+            .expect("Soket key alone should load without Slack tokens");
+        assert_eq!(key.expose(), "sk-test-soket-key");
+    }
+
+    #[test]
     fn loads_all_secrets_and_redacts_them_in_debug_and_display() {
         let vars = [
             (SOKET_API_KEY_VAR, "sk-test-soket-key"),
             (SLACK_BOT_TOKEN_VAR, "xoxb-1234567890-abcdef"),
             (SLACK_APP_TOKEN_VAR, "xapp-1-A1B2C3D4E5"),
         ];
-        let secrets =
-            Secrets::from_lookup(lookup_from(&vars)).expect("valid variables should load");
+        let key = soket_key_from_lookup(lookup_from(&vars)).expect("valid Soket key should load");
+        let slack =
+            SlackSecrets::from_lookup(lookup_from(&vars)).expect("valid Slack tokens should load");
 
         // Real values are available only through expose().
-        assert_eq!(secrets.soket_api_key.expose(), "sk-test-soket-key");
-        assert_eq!(secrets.slack_bot_token.expose(), "xoxb-1234567890-abcdef");
-        assert_eq!(secrets.slack_app_token.expose(), "xapp-1-A1B2C3D4E5");
+        assert_eq!(key.expose(), "sk-test-soket-key");
+        assert_eq!(slack.bot_token.expose(), "xoxb-1234567890-abcdef");
+        assert_eq!(slack.app_token.expose(), "xapp-1-A1B2C3D4E5");
 
         // Debug and Display never reveal values, individually or nested.
-        assert_eq!(format!("{:?}", secrets.soket_api_key), "[REDACTED]");
-        assert_eq!(format!("{}", secrets.slack_bot_token), "[REDACTED]");
-        let whole = format!("{secrets:?}");
+        assert_eq!(format!("{:?}", key), "[REDACTED]");
+        assert_eq!(format!("{}", slack.bot_token), "[REDACTED]");
+        let whole = format!("{slack:?}");
         assert!(
             whole.contains("[REDACTED]"),
             "struct Debug should redact: {whole}"
@@ -182,12 +215,17 @@ mod tests {
 
     #[test]
     fn missing_or_malformed_variable_gives_clear_error() {
+        // Soket key absent.
+        let err = soket_key_from_lookup(lookup_from(&[])).expect_err("missing Soket key must fail");
+        assert!(
+            err.to_string().contains("SOKET_API_KEY"),
+            "error should name the missing variable: {err}"
+        );
+
         // SLACK_APP_TOKEN absent.
-        let vars = [
-            (SOKET_API_KEY_VAR, "sk-test-soket-key"),
-            (SLACK_BOT_TOKEN_VAR, "xoxb-1234567890-abcdef"),
-        ];
-        let err = Secrets::from_lookup(lookup_from(&vars)).expect_err("missing variable must fail");
+        let vars = [(SLACK_BOT_TOKEN_VAR, "xoxb-1234567890-abcdef")];
+        let err =
+            SlackSecrets::from_lookup(lookup_from(&vars)).expect_err("missing variable must fail");
         assert!(
             err.to_string().contains("SLACK_APP_TOKEN"),
             "error should name the missing variable: {err}"
@@ -195,11 +233,11 @@ mod tests {
 
         // SLACK_APP_TOKEN set but empty counts as missing too.
         let vars = [
-            (SOKET_API_KEY_VAR, "sk-test-soket-key"),
             (SLACK_BOT_TOKEN_VAR, "xoxb-1234567890-abcdef"),
             (SLACK_APP_TOKEN_VAR, "   "),
         ];
-        let err = Secrets::from_lookup(lookup_from(&vars)).expect_err("empty variable must fail");
+        let err =
+            SlackSecrets::from_lookup(lookup_from(&vars)).expect_err("empty variable must fail");
         assert!(
             err.to_string().contains("SLACK_APP_TOKEN"),
             "error should name the empty variable: {err}"
@@ -208,11 +246,11 @@ mod tests {
         // Bot token with the wrong prefix: error names the variable and the
         // expected prefix, never the token value.
         let vars = [
-            (SOKET_API_KEY_VAR, "sk-test-soket-key"),
             (SLACK_BOT_TOKEN_VAR, "xoxp-not-a-bot-token"),
             (SLACK_APP_TOKEN_VAR, "xapp-1-A1B2C3D4E5"),
         ];
-        let err = Secrets::from_lookup(lookup_from(&vars)).expect_err("wrong prefix must fail");
+        let err =
+            SlackSecrets::from_lookup(lookup_from(&vars)).expect_err("wrong prefix must fail");
         let msg = err.to_string();
         assert!(
             msg.contains("SLACK_BOT_TOKEN"),
