@@ -1,5 +1,6 @@
 mod arxiv;
 mod config;
+mod llm;
 mod secrets;
 
 use anyhow::Context;
