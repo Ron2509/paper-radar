@@ -5,6 +5,7 @@ mod filter;
 mod llm;
 mod ranking;
 mod secrets;
+mod slack;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
@@ -72,17 +73,13 @@ async fn cmd_fetch() -> anyhow::Result<()> {
 }
 
 async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> anyhow::Result<()> {
-    // A saved feed is a testing convenience; posting a digest built from it
-    // would be surprising, so require --dry-run alongside it.
-    if feed_file.is_some() && !dry_run {
-        anyhow::bail!("--feed-file requires --dry-run");
-    }
-
     let config = config::Config::load_default().context("loading config")?;
     let soket_key = secrets::load_soket_key().context("loading Soket API key")?;
-    if !dry_run {
-        let _slack = secrets::SlackSecrets::load().context("loading Slack tokens")?;
-    }
+    let slack = if dry_run {
+        None
+    } else {
+        Some(secrets::SlackSecrets::load().context("loading Slack tokens")?)
+    };
 
     let papers = match &feed_file {
         Some(path) => {
@@ -116,6 +113,18 @@ async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> any
 
     if picks.is_empty() {
         println!("No strongly relevant papers today");
+        if let Some(slack) = &slack {
+            if config.digest.post_when_empty {
+                let ts = slack::post_message(
+                    slack.bot_token.expose(),
+                    &config.slack.channel_id,
+                    &slack::sanitize_for_slack("No strongly relevant papers today"),
+                    None,
+                )
+                .await?;
+                println!("posted to Slack, ts {ts}");
+            }
+        }
         return Ok(());
     }
 
@@ -123,7 +132,15 @@ async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> any
     if dry_run {
         print!("{text}");
     } else {
-        println!("posting not implemented yet");
+        let slack = slack.expect("slack secrets loaded when not dry-run");
+        let ts = slack::post_message(
+            slack.bot_token.expose(),
+            &config.slack.channel_id,
+            &slack::sanitize_for_slack(&text),
+            None,
+        )
+        .await?;
+        println!("posted to Slack, ts {ts}");
     }
     Ok(())
 }
