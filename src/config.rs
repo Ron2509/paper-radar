@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Configuration loading for paper-radar.
 //!
 //! Reads `config.toml` into typed structs, one per TOML section. Each section
@@ -7,7 +8,6 @@
 
 // TODO(wiring): remove once `main` starts using the config; until then the
 // structs are only consumed by tests.
-#![allow(dead_code)]
 
 use std::path::Path;
 

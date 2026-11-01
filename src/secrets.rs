@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Secrets handling for paper-radar.
 //!
 //! Loads `SOKET_API_KEY`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from the
@@ -12,7 +13,6 @@
 
 // TODO(wiring): remove once `main` starts using secrets; until then these
 // types are only consumed by tests.
-#![allow(dead_code)]
 
 use std::fmt;
 

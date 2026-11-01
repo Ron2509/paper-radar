@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Thin wrapper around the Loop agent harness for LLM calls.
 //!
 //! All paper-radar prompts go through [`LlmClient`], so tests can substitute
@@ -11,7 +12,6 @@
 
 // TODO(wiring): remove once the digest pipeline calls the LLM; until then
 // SoketLlm is only exercised manually.
-#![allow(dead_code)]
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

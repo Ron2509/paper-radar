@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Keyword prefilter (stage 2 of relevance filtering).
 //!
 //! Cheap, deterministic, no LLM: a paper survives only if its title +
@@ -8,7 +9,6 @@
 
 // TODO(wiring): remove once the digest pipeline calls the prefilter; until
 // then keyword_filter is only exercised by tests.
-#![allow(dead_code)]
 
 use crate::arxiv::Paper;
 
