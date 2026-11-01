@@ -15,11 +15,9 @@ use crate::arxiv::Paper;
 /// Keeps papers whose title + abstract contain at least one keyword.
 ///
 /// Matching is case-insensitive and whole-term: every character boundary
-/// around a candidate match must not be an ASCII letter or digit. A keyword
-/// that itself contains digits (e.g. "gpu") still matches, as long as it is
-/// not embedded in a longer alphanumeric run (so "gpus" does not match
-/// "gpu"; add plural forms to the config if wanted). Papers are returned in
-/// input order.
+/// around a candidate match must not be an ASCII letter or digit, except that
+/// a single trailing plural "s" is accepted ("jailbreaks" matches
+/// "jailbreak", "jailbreaking" does not). Papers are returned in input order.
 pub fn keyword_filter(papers: Vec<Paper>, keywords: &[String]) -> Vec<Paper> {
     let needles: Vec<String> = keywords
         .iter()
@@ -40,21 +38,36 @@ pub fn keyword_filter(papers: Vec<Paper>, keywords: &[String]) -> Vec<Paper> {
 
 /// Whether `haystack` (already lowercased) contains `needle` (already
 /// lowercased, non-empty) with no ASCII alphanumeric character immediately
-/// before or after the match.
+/// before or after the match. A single plural "s" right after the match is
+/// tolerated ("jailbreaks" matches "jailbreak"); anything longer is not
+/// ("jailbreaking" does not match).
 fn contains_whole_term(haystack: &str, needle: &str) -> bool {
+    // Step past the needle's first CHARACTER, not its first byte: a
+    // multi-byte first character (non-ASCII keyword) would otherwise leave
+    // `start` mid-character and panic on the next slice.
+    let step = needle.chars().next().map_or(1, char::len_utf8);
     let mut start = 0;
     while let Some(pos) = haystack[start..].find(needle) {
         let at = start + pos;
         let end = at + needle.len();
 
         let boundary_before_ok = at == 0 || !is_word_byte(haystack.as_bytes()[at - 1]);
-        let boundary_after_ok = end == haystack.len() || !is_word_byte(haystack.as_bytes()[end]);
+
+        // Swallow one optional plural "s". `b's'` can never be a UTF-8
+        // continuation byte, so the byte check is safe.
+        let plural_end = if end < haystack.len() && haystack.as_bytes()[end] == b's' {
+            end + 1
+        } else {
+            end
+        };
+        let boundary_after_ok =
+            plural_end == haystack.len() || !is_word_byte(haystack.as_bytes()[plural_end]);
 
         if boundary_before_ok && boundary_after_ok {
             return true;
         }
-        // Overlapping candidates: step past this hit's first byte.
-        start = at + 1;
+        // Overlapping candidates: step past this hit's first character.
+        start = at + step;
     }
     false
 }
@@ -156,5 +169,54 @@ mod tests {
         let kept = keyword_filter(papers, &kws);
         let ids: Vec<&str> = kept.iter().map(|p| p.id.as_str()).collect();
         assert_eq!(ids, ["2501.00005", "2501.00007"]);
+    }
+
+    #[test]
+    fn a_single_trailing_s_is_accepted_but_longer_suffixes_are_not() {
+        let kws = keywords(&["jailbreak", "tokenizer"]);
+
+        // Plain plural: matches.
+        assert!(contains_whole_term(
+            "we study jailbreaks of aligned models",
+            "jailbreak"
+        ));
+        // Derived word with more after the stem: no match.
+        assert!(!contains_whole_term(
+            "jailbreaking aligned models is easy",
+            "jailbreak"
+        ));
+        // Plural of a multi-word keyword also matches.
+        assert!(contains_whole_term(
+            "better tokenizers for indic scripts",
+            "tokenizer"
+        ));
+        // And through the public API, with case folding.
+        let papers = vec![
+            paper("2501.00008", "Jailbreaks Galore", "Many jailbreaks found."),
+            paper("2501.00009", "Other work", "Unrelated content entirely."),
+        ];
+        let kept = keyword_filter(papers, &kws);
+        let ids: Vec<&str> = kept.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["2501.00008"]);
+    }
+
+    #[test]
+    fn non_ascii_needles_do_not_panic_and_still_match() {
+        // A needle whose first character is multi-byte used to advance `start`
+        // by one byte, landing mid-character and panicking on the next slice.
+        // With per-character stepping it must simply work.
+        let needle = "मॉडल"; // "model" in Hindi
+        assert!(contains_whole_term("हम मॉडल बनाते हैं", needle));
+
+        // Non-ASCII neighbours are boundaries (only a-z/0-9 are word
+        // characters), so Devanagari suffixes do not block a match...
+        assert!(contains_whole_term("मॉडलिंग करते हैं", needle));
+        // ...but ASCII alphanumeric neighbours still do.
+        assert!(!contains_whole_term("मॉडलx सिस्टम", needle));
+        assert!(!contains_whole_term("xमॉडल सिस्टम", needle));
+
+        // Overlap retry path with a multi-byte first character: the needle
+        // appears embedded once (bad boundary), then standalone (good).
+        assert!(contains_whole_term("xमॉडल और मॉडल", needle));
     }
 }
