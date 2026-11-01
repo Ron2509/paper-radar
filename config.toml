@@ -29,21 +29,29 @@ topics = [
     "Kubernetes and GPU cluster scheduling",
     "model attacks (jailbreaks, prompt injection, red-teaming, safety)",
     "new model releases and technical reports",
+    "Project EKA: sovereign foundation models for Indian, Global South and programming languages",
+    "frontier model training, deployment and large-scale data curation",
+    "on-policy distillation",
+    "agent harnesses: tool use, compaction, evaluation, guardrails",
+    "model benchmarking and safety evaluation",
+    "software supply chain security for AI infrastructure",
+    "on-premise and air-gapped inference platforms",
 ]
 
 # Keyword prefilter (no LLM): papers whose title+abstract match none of these
 # are dropped before scoring. Case-insensitive; whole-word where it matters.
 keywords = [
-    "llm", "large language model", "language model", "transformer",
-    "inference", "serving", "kv cache", "batching", "speculative decoding",
-    "quantization", "tokenizer", "tokenization", "low-resource",
-    "multilingual", "indic", "fine-tuning", "finetuning", "sft",
-    "rlhf", "grpo", "dpo", "reinforcement learning", "reward model",
-    "scaling law", "training", "distributed training", "megatron",
-    "sglang", "litellm", "vllm", "rust", "gpu", "kubernetes",
-    "cluster scheduling", "gcp", "jailbreak", "prompt injection",
-    "red-team", "red team", "safety", "alignment", "model evaluation",
-    "model testing", "benchmark", "technical report", "model release",
+    "sglang", "vllm", "litellm", "kv cache", "speculative decoding",
+    "prefill", "model serving", "inference serving", "quantization",
+    "distributed training", "megatron", "scaling law", "sft", "rlhf",
+    "grpo", "dpo", "reward model", "on-policy distillation", "opd",
+    "tokenizer", "frontier model", "technical report", "sovereign",
+    "agent harness", "coding agent", "model context protocol",
+    "context compaction", "model evaluation", "jailbreak",
+    "prompt injection", "red-teaming", "red team", "supply chain attack",
+    "supply-chain attack", "malicious package", "data poisoning",
+    "backdoor attack", "indic", "indian languages", "hindi", "bengali",
+    "tamil",
 ]
 
 [digest]
