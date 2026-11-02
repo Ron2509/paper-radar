@@ -98,7 +98,7 @@ flowchart LR
 
 ## Low-level diagram
 
-This is for engineers. The first diagram shows the Rust modules and how data moves between them.
+This is for engineers. It shows the Rust modules and how data moves between them.
 
 ```mermaid
 flowchart TD
@@ -132,47 +132,6 @@ flowchart TD
     rss --> arxiv
     llm <--> provider
     slack --> slackapi
-```
-
-The second diagram shows one `digest` run in order.
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor You as Person
-    participant Bot as Paper Radar
-    participant Arxiv as arXiv RSS
-    participant Model as AI provider
-    participant Slack as Slack
-
-    You->>Bot: paper-radar digest
-    Note over Bot: Load config.toml<br/>and .env
-    Bot->>Arxiv: GET the five categories
-    Arxiv-->>Bot: Today's papers
-    Note over Bot: Keep new and<br/>cross-listed papers
-    Note over Bot: Keep papers matching<br/>a keyword
-
-    loop Every batch of 15 papers
-        Bot->>Model: Team topics and paper text
-        Model-->>Bot: JSON with id, score, reason
-        Note over Bot: Reject unknown ids
-        opt Reply failed or was not valid JSON
-            Bot->>Model: Retry once, then skip the batch
-        end
-    end
-
-    Note over Bot: Keep score 7 or above,<br/>sort, take top 5
-
-    alt At least one paper passed
-        loop Each chosen paper
-            Bot->>Model: Title and abstract
-            Model-->>Bot: Summary and why it matters
-        end
-        Note over Bot: Remove mentions,<br/>cap message length
-        Bot->>Slack: chat.postMessage
-    else No paper passed
-        Bot->>Slack: "No strongly relevant papers today"
-    end
 ```
 
 ### Modules
