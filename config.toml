@@ -1,8 +1,17 @@
 # Paper Radar configuration.
 
 [model]
-# Soket model id used for relevance scoring and summaries.
+# Any OpenAI-compatible chat API works here (Soket, LiteLLM, OpenRouter,
+# OpenAI, Claude, or a local server): change base_url, model and LLM_API_KEY
+# in .env — never code. Requests go to `{base_url}/chat/completions`.
+base_url = "https://api.soket.ai/v1"
+# Model id used for relevance scoring and summaries.
 model = "GLM-5.3"
+# Output limit per request. Reasoning tokens count toward this limit.
+max_tokens = 32768
+# JSON field name for the output limit: "max_tokens" or
+# "max_completion_tokens" (OpenAI's newer models need the second).
+max_tokens_field = "max_tokens"
 
 [arxiv]
 # arXiv categories fetched every morning.

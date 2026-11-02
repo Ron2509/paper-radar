@@ -37,12 +37,32 @@ pub enum ConfigError {
     Invalid { path: String, message: String },
 }
 
-/// `[model]` — Soket model used for scoring and summaries.
+/// `[model]` — LLM used for scoring and summaries via any
+/// OpenAI-compatible chat API.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// Soket model id, e.g. "GLM-5.3".
+    /// Base URL of an OpenAI-compatible provider, e.g.
+    /// "https://api.soket.ai/v1". Requests go to `{base_url}/chat/completions`.
+    /// Must be HTTPS; plain HTTP is allowed only for localhost / 127.0.0.1.
+    pub base_url: String,
+    /// Model id, e.g. "GLM-5.3".
     pub model: String,
+    /// Output limit per request. Reasoning tokens count toward this limit.
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    /// JSON field name for the output limit: "max_tokens" or
+    /// "max_completion_tokens" (OpenAI's newer models need the second).
+    #[serde(default = "default_max_tokens_field")]
+    pub max_tokens_field: String,
+}
+
+fn default_max_tokens() -> u32 {
+    32768
+}
+
+fn default_max_tokens_field() -> String {
+    "max_tokens".to_string()
 }
 
 /// `[arxiv]` — what to fetch and how politely.
@@ -173,6 +193,36 @@ impl Config {
         if self.model.model.trim().is_empty() {
             return Err(err("[model] model must not be empty".to_string()));
         }
+        let base_url = url::Url::parse(self.model.base_url.trim()).map_err(|e| {
+            err(format!(
+                "[model] invalid base_url {:?}: {e}",
+                self.model.base_url
+            ))
+        })?;
+        let host_is_local = matches!(base_url.host_str(), Some("localhost" | "127.0.0.1"));
+        match base_url.scheme() {
+            "https" => {}
+            "http" if host_is_local => {}
+            scheme => {
+                return Err(err(format!(
+                    "[model] base_url scheme must be https (http is allowed only for \
+                     localhost / 127.0.0.1), got {scheme:?} in {:?}",
+                    self.model.base_url
+                )));
+            }
+        }
+        if self.model.max_tokens == 0 {
+            return Err(err("[model] max_tokens must be above 0".to_string()));
+        }
+        if self.model.max_tokens_field != "max_tokens"
+            && self.model.max_tokens_field != "max_completion_tokens"
+        {
+            return Err(err(format!(
+                "[model] max_tokens_field must be \"max_tokens\" or \"max_completion_tokens\",\
+                 got {:?}",
+                self.model.max_tokens_field
+            )));
+        }
         if self.arxiv.categories.is_empty() {
             return Err(err("[arxiv] categories must not be empty".to_string()));
         }
@@ -264,6 +314,7 @@ mod tests {
 
     const FULL_CONFIG: &str = r#"
 [model]
+base_url = "https://api.soket.ai/v1"
 model = "GLM-5.3"
 
 [arxiv]
@@ -294,7 +345,10 @@ weekdays_only = true
     fn loads_all_sections_from_valid_toml() {
         let cfg = Config::from_toml_str(FULL_CONFIG).expect("valid config should parse");
 
+        assert_eq!(cfg.model.base_url, "https://api.soket.ai/v1");
         assert_eq!(cfg.model.model, "GLM-5.3");
+        assert_eq!(cfg.model.max_tokens, 32768);
+        assert_eq!(cfg.model.max_tokens_field, "max_tokens");
         assert_eq!(cfg.arxiv.categories.len(), 5);
         assert_eq!(cfg.arxiv.categories[0], "cs.CL");
         assert_eq!(cfg.arxiv.contact_email, "team@example.com");
@@ -343,5 +397,73 @@ weekdays_only = true
             msg.contains("chanel_id"),
             "error should name the typo'd field: {msg}"
         );
+    }
+
+    #[test]
+    fn model_defaults_apply_when_optional_fields_are_absent() {
+        // [model] with only base_url and model: defaults must fill in.
+        let minimal = FULL_CONFIG
+            .replacen("base_url = \"https://api.soket.ai/v1\"\n", "", 1)
+            .replacen(
+                "model = \"GLM-5.3\"\n",
+                "model = \"GLM-5.3\"\nbase_url = \"http://localhost:8000/v1\"\n",
+                1,
+            );
+
+        let cfg = Config::from_toml_str(&minimal).expect("minimal [model] should parse");
+        assert_eq!(cfg.model.base_url, "http://localhost:8000/v1");
+        assert_eq!(cfg.model.max_tokens, 32768);
+        assert_eq!(cfg.model.max_tokens_field, "max_tokens");
+    }
+
+    #[test]
+    fn http_non_local_base_url_is_rejected() {
+        let bad = FULL_CONFIG.replacen("https://api.soket.ai/v1", "http://api.soket.ai/v1", 1);
+
+        let err = Config::from_toml_str(&bad).expect_err("plain http to a remote host must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("[model]") && msg.contains("https"),
+            "error should explain the https rule: {msg}"
+        );
+    }
+
+    #[test]
+    fn http_localhost_base_url_is_accepted() {
+        for base in ["http://localhost:8080/v1", "http://127.0.0.1:11434/v1"] {
+            let good = FULL_CONFIG.replacen("https://api.soket.ai/v1", base, 1);
+            let cfg = Config::from_toml_str(&good)
+                .unwrap_or_else(|e| panic!("local http base {base:?} should be allowed: {e}"));
+            assert_eq!(cfg.model.base_url, base);
+        }
+    }
+
+    #[test]
+    fn bad_max_tokens_field_is_rejected() {
+        let bad = FULL_CONFIG.replacen(
+            "model = \"GLM-5.3\"\n",
+            "model = \"GLM-5.3\"\nmax_tokens_field = \"num_tokens\"\n",
+            1,
+        );
+
+        let err = Config::from_toml_str(&bad).expect_err("unknown max_tokens_field must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("max_tokens_field"),
+            "error should name the field: {msg}"
+        );
+    }
+
+    #[test]
+    fn zero_max_tokens_is_rejected() {
+        let bad = FULL_CONFIG.replacen(
+            "model = \"GLM-5.3\"\n",
+            "model = \"GLM-5.3\"\nmax_tokens = 0\n",
+            1,
+        );
+
+        let err = Config::from_toml_str(&bad).expect_err("zero max_tokens must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("max_tokens"), "error should name it: {msg}");
     }
 }

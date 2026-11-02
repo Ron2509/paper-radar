@@ -55,45 +55,41 @@ Applies to every paper source (arXiv now, others later).
 ## Tech stack (use current stable versions; check crates.io, do not guess)
 
 - Rust 2021, stable toolchain, single binary crate `paper-radar`.
-- Loop harness, pinned to the release tag:
-  `loop-agent = { git = "https://github.com/soketlabs/loop", tag = "v0.5.0" }`
-  `loop-ai    = { git = "https://github.com/soketlabs/loop", tag = "v0.5.0" }`
+- No Loop crates at runtime. Loop is the tool that builds this project; the bot
+  itself calls the model over plain HTTP (see "How the LLM is called").
 - tokio, reqwest (rustls TLS), serde, serde_json, toml, quick-xml or feed-rs
   (arXiv Atom feed), rusqlite (bundled) for state, chrono + chrono-tz,
   tracing + tracing-subscriber, anyhow/thiserror, clap, dotenvy.
 - Slack: a maintained crate with Socket Mode support (e.g. slack-morphism),
   or the Slack Web API + Socket Mode websocket directly if no crate fits.
 
-## How the LLM is called (Loop harness)
+## How the LLM is called (any OpenAI-compatible provider)
 
-- `loop_ai::Models::new()`, `models.set_provider(loop_ai::providers::soket_provider())`,
-  API key from env `SOKET_API_KEY`, refresh the model list, then
-  `models.get_model("soket", <LOOP_MODEL>)`. Default model `GLM-5.3` (use the exact id shown by `/model` in the loop CLI).
-- `loop_agent::harness::AgentHarness::new(AgentHarnessOptions { .. })` with
-  `tools: vec![]` (NO tools — see Security), `SandboxMode::Disabled`,
-  a JSONL session store under `data/sessions/` (`create_jsonl_session_store`,
-  `create_session_repository`), and a task-specific `system_prompt`.
-- One Loop session per daily digest, so "go deeper" follow-ups resume that
-  day's session and keep context.
-- Reference for the API shape: `crates/loop-agent/tests/harness_basic.rs` in
-  the Loop repo at tag v0.5.0.
-- When asking the LLM for structured output (ranking scores), request JSON,
-  parse it strictly, and validate: every returned paper id must be one we sent.
-  Retry once on bad output, then skip that batch and log it.
-
-- GLM-5.3 always reasons before answering, and reasoning counts toward the
-  output limit. Loop defaults the limit to the model list's `maxTokens`
-  (16,384) when none is set; the Soket API accepts higher values. Set the
-  model's `max_tokens` to 32,768 before passing it to the harness. A reply can
-  still end with stop reason `length` and an empty answer. Treat that as a
-  failure: log it, retry once with a smaller input (fewer papers per batch,
-  shorter paper text), then skip.
-  Keep each LLM call small (e.g. ranking batches of ~15 abstracts). Do not
-  send `reasoning_effort` or thinking flags: the Soket API rejects them (400).
+- The bot works with any provider that offers an OpenAI-compatible chat API:
+  Soket, LiteLLM, OpenRouter, OpenAI, Claude, or a local server. Changing
+  provider means changing `[model]` in `config.toml` and `LLM_API_KEY` in
+  `.env`, never code.
+- `[model]` has `base_url`, `model`, `max_tokens` and `max_tokens_field`.
+  `max_tokens_field` is the JSON field name for the output limit: `max_tokens`
+  or `max_completion_tokens` (OpenAI's newer models need the second).
+- One request format only: `POST {base_url}/chat/completions` with header
+  `Authorization: Bearer <LLM_API_KEY>` and a JSON body holding `model`, the
+  output limit field, and `messages` (one `system`, one `user`). Not streamed.
+- Do not send `temperature`, `top_p`, `response_format`, `reasoning_effort`,
+  thinking flags or tools. Some providers reject each of them with a 400.
+- The answer is `choices[0].message.content`. Each call stands alone: the client
+  keeps no conversation, and `LlmClient::reset` does nothing.
+- When asking the LLM for structured output (ranking scores), request JSON in
+  the prompt, parse it strictly, and validate: every returned paper id must be
+  one we sent. Retry once on bad output, then skip that batch and log it.
+- Some models reason before answering, and reasoning counts toward the output
+  limit, so a reply can arrive with `finish_reason: length` and no text. Treat
+  empty or missing content as `LlmError::EmptyReply`. Keep each LLM call small
+  (e.g. ranking batches of ~15 abstracts).
 
 ## Security rules (mandatory)
 
-1. Secrets: `SOKET_API_KEY`, `SLACK_BOT_TOKEN` (xoxb-), `SLACK_APP_TOKEN`
+1. Secrets: `LLM_API_KEY`, `SLACK_BOT_TOKEN` (xoxb-), `SLACK_APP_TOKEN`
    (xapp-) come only from environment / a `.env` file. `.env` is in
    `.gitignore`; commit `.env.example` with placeholder values only. Never
    print, log or include secrets in error messages. Wrap them in a type whose
@@ -105,7 +101,10 @@ Applies to every paper source (arXiv now, others later).
    instructions. Never let model output decide which URL to fetch, which file
    to touch or which channel to post to.
 4. Network allowlist: HTTPS only, hosts `export.arxiv.org` and `arxiv.org`
-   (plus Slack and the Soket API). Reject everything else. Timeouts on every
+   (plus Slack and the host of `[model] base_url`). The LLM key goes only to
+   that host: never follow redirects on LLM calls. `base_url` must be HTTPS;
+   plain `http` is allowed only for `localhost` and `127.0.0.1`. Reject
+   everything else. Timeouts on every
    request, max response size (e.g. 5 MB), follow at most 3 redirects and
    re-check the host after each.
 5. arXiv rate limit: at most one request every 3 seconds; set a descriptive
@@ -124,12 +123,12 @@ Applies to every paper source (arXiv now, others later).
 
 ## Code quality
 
-- Modules: `config`, `secrets`, `arxiv`, `llm` (Loop wrapper), `profile`,
+- Modules: `config`, `secrets`, `arxiv`, `llm` (HTTP chat client), `profile`,
   `ranking`, `digest`, `store`, `slack`, `scheduler`, `main`.
 - `cargo fmt`, `cargo clippy -- -D warnings`, `cargo test` must all pass
   before you say a task is done.
 - Unit tests with fixtures (saved arXiv Atom XML, fake Slack events). Tests
-  never call the real arXiv, Slack or Soket APIs. Put LLM calls behind a
+  never call the real arXiv, Slack or LLM APIs. Put LLM calls behind a
   trait so tests use a fake.
 - Every command supports `--dry-run`: print to the terminal instead of Slack.
 - Small focused commits with clear messages. Do not commit `.env` or `data/`.
