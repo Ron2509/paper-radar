@@ -74,7 +74,7 @@ async fn cmd_fetch() -> anyhow::Result<()> {
 
 async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> anyhow::Result<()> {
     let config = config::Config::load_default().context("loading config")?;
-    let soket_key = secrets::load_soket_key().context("loading Soket API key")?;
+    let llm_key = secrets::load_llm_key().context("loading LLM API key")?;
     let slack = if dry_run {
         None
     } else {
@@ -99,7 +99,7 @@ async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> any
     let kept = filter::keyword_filter(papers, &config.topics.keywords);
     let keywords_kept = kept.len();
 
-    let llm = llm::SoketLlm::new(soket_key.expose(), &config.model.model).await?;
+    let llm = llm::SoketLlm::new(llm_key.expose(), &config.model.model).await?;
     let scored = ranking::score_papers(&llm, &kept, &config.topics.topics).await;
     let picks = digest::select_papers(scored, config.digest.min_score, config.digest.max_papers);
 
@@ -147,7 +147,7 @@ async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> any
 
 async fn cmd_run() -> anyhow::Result<()> {
     let _config = config::Config::load_default().context("loading config")?;
-    let _soket_key = secrets::load_soket_key().context("loading Soket API key")?;
+    let _llm_key = secrets::load_llm_key().context("loading LLM API key")?;
     let _slack = secrets::SlackSecrets::load().context("loading Slack tokens")?;
     println!("run: not implemented yet");
     Ok(())

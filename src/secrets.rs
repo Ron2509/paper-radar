@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 //! Secrets handling for paper-radar.
 //!
-//! Loads `SOKET_API_KEY`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from the
+//! Loads `LLM_API_KEY`, `SLACK_BOT_TOKEN` and `SLACK_APP_TOKEN` from the
 //! environment, with an optional `.env` file applied first via dotenvy (real
 //! environment variables always win). Loading is split so a command only
-//! requires what it actually uses: [`load_soket_key`] fetches just the Soket
-//! LLM API key (enough for scoring and dry runs), while [`SlackSecrets`]
+//! requires what it actually uses: [`load_llm_key`] fetches just the LLM API
+//! key (enough for scoring and dry runs), while [`SlackSecrets`]
 //! fetches the two Slack tokens needed to post or listen. Each value is
 //! wrapped in [`Secret`], whose `Debug` and `Display` print `[REDACTED]`, so
 //! a secret can never leak into logs or error messages. Call
@@ -18,8 +18,8 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// Name of the Soket API key environment variable.
-pub const SOKET_API_KEY_VAR: &str = "SOKET_API_KEY";
+/// Name of the LLM API key environment variable.
+pub const LLM_API_KEY_VAR: &str = "LLM_API_KEY";
 /// Name of the Slack bot token environment variable.
 pub const SLACK_BOT_TOKEN_VAR: &str = "SLACK_BOT_TOKEN";
 /// Name of the Slack app (Socket Mode) token environment variable.
@@ -76,25 +76,25 @@ impl fmt::Display for Secret {
     }
 }
 
-/// Loads the Soket API key from the process environment, applying `.env`
+/// Loads the LLM API key from the process environment, applying `.env`
 /// first if present. A missing or unreadable `.env` is not an error as long
 /// as the variable comes from the shell. No Slack token is required.
-pub fn load_soket_key() -> Result<Secret, SecretsError> {
-    soket_key_from_lookup(env_lookup())
+pub fn load_llm_key() -> Result<Secret, SecretsError> {
+    llm_key_from_lookup(env_lookup())
 }
 
-/// Loads the Soket API key from a lookup function instead of the real
-/// environment. Used by `load_soket_key` and by tests.
-pub fn soket_key_from_lookup(
+/// Loads the LLM API key from a lookup function instead of the real
+/// environment. Used by `load_llm_key` and by tests.
+pub fn llm_key_from_lookup(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<Secret, SecretsError> {
-    Ok(Secret::new(require(&lookup, SOKET_API_KEY_VAR)?))
+    Ok(Secret::new(require(&lookup, LLM_API_KEY_VAR)?))
 }
 
 /// The two Slack tokens paper-radar needs, loaded and validated.
 ///
 /// Only commands that talk to Slack (posting the digest, the Socket Mode
-/// listener) need these; fetching and dry runs run on the Soket key alone.
+/// listener) need these; fetching and dry runs run on the LLM key alone.
 #[derive(Debug, Clone)]
 pub struct SlackSecrets {
     /// Slack bot token (`xoxb-...`).
@@ -175,28 +175,28 @@ mod tests {
     }
 
     #[test]
-    fn soket_key_loads_without_slack_tokens() {
-        // Only the Soket key is set: loading it must succeed even though
+    fn llm_key_loads_without_slack_tokens() {
+        // Only the LLM key is set: loading it must succeed even though
         // neither Slack token exists.
-        let vars = [(SOKET_API_KEY_VAR, "sk-test-soket-key")];
-        let key = soket_key_from_lookup(lookup_from(&vars))
-            .expect("Soket key alone should load without Slack tokens");
-        assert_eq!(key.expose(), "sk-test-soket-key");
+        let vars = [(LLM_API_KEY_VAR, "sk-test-llm-key")];
+        let key = llm_key_from_lookup(lookup_from(&vars))
+            .expect("LLM key alone should load without Slack tokens");
+        assert_eq!(key.expose(), "sk-test-llm-key");
     }
 
     #[test]
     fn loads_all_secrets_and_redacts_them_in_debug_and_display() {
         let vars = [
-            (SOKET_API_KEY_VAR, "sk-test-soket-key"),
+            (LLM_API_KEY_VAR, "sk-test-llm-key"),
             (SLACK_BOT_TOKEN_VAR, "xoxb-1234567890-abcdef"),
             (SLACK_APP_TOKEN_VAR, "xapp-1-A1B2C3D4E5"),
         ];
-        let key = soket_key_from_lookup(lookup_from(&vars)).expect("valid Soket key should load");
+        let key = llm_key_from_lookup(lookup_from(&vars)).expect("valid LLM key should load");
         let slack =
             SlackSecrets::from_lookup(lookup_from(&vars)).expect("valid Slack tokens should load");
 
         // Real values are available only through expose().
-        assert_eq!(key.expose(), "sk-test-soket-key");
+        assert_eq!(key.expose(), "sk-test-llm-key");
         assert_eq!(slack.bot_token.expose(), "xoxb-1234567890-abcdef");
         assert_eq!(slack.app_token.expose(), "xapp-1-A1B2C3D4E5");
 
@@ -208,17 +208,17 @@ mod tests {
             whole.contains("[REDACTED]"),
             "struct Debug should redact: {whole}"
         );
-        assert!(!whole.contains("sk-test-soket-key"));
+        assert!(!whole.contains("sk-test-llm-key"));
         assert!(!whole.contains("xoxb-"));
         assert!(!whole.contains("xapp-"));
     }
 
     #[test]
     fn missing_or_malformed_variable_gives_clear_error() {
-        // Soket key absent.
-        let err = soket_key_from_lookup(lookup_from(&[])).expect_err("missing Soket key must fail");
+        // LLM key absent.
+        let err = llm_key_from_lookup(lookup_from(&[])).expect_err("missing LLM key must fail");
         assert!(
-            err.to_string().contains("SOKET_API_KEY"),
+            err.to_string().contains("LLM_API_KEY"),
             "error should name the missing variable: {err}"
         );
 
