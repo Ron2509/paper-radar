@@ -13,11 +13,9 @@
 //! `POST {base_url}/chat/completions` with a bearer token, one system and
 //! one user message, no streaming, no `temperature`, no tools. Redirects are
 //! never followed, so the API key can only ever reach the configured host.
-//! [`SoketLlm`] is the older client built on the Loop harness, kept until
-//! `main` migrates to `ChatLlm`.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -25,18 +23,6 @@ use serde_json::{json, Value};
 
 use crate::config::ModelConfig;
 use crate::secrets::Secret;
-
-use loop_agent::harness::{
-    create_in_memory_session_store, create_session_repository, AgentHarness, AgentHarnessOptions,
-    HostExecutionEnv, SandboxMode,
-};
-use loop_ai::providers::{soket_provider, SOKET_PROVIDER_ID};
-use loop_ai::{AssistantContent, Credential, Models, ModelsRefreshOptions};
-
-/// Output limit for Soket models via the Loop harness. GLM-5.3 always reasons
-/// before answering and reasoning counts toward the limit, so the catalog
-/// default of 16,384 can be exhausted by reasoning alone.
-const MAX_OUTPUT_TOKENS: u64 = 32_768;
 
 /// Hard cap on one response body (AGENTS.md: max response size 5 MB).
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
@@ -198,7 +184,7 @@ impl LlmClient for ChatLlm {
             return Err(LlmError::Call(format!(
                 "provider returned {}: {}",
                 status,
-                redact(&truncate_chars(&body, MAX_ERROR_BODY_CHARS), &self.api_key)
+                truncate_chars(&redact(&body, &self.api_key), MAX_ERROR_BODY_CHARS)
             )));
         }
         parse_reply(&body)
@@ -247,121 +233,6 @@ fn redact(s: &str, api_key: &Secret) -> String {
     }
 }
 
-/// [`LlmClient`] backed by the Soket provider through the Loop harness.
-///
-/// Kept until `main` migrates to [`ChatLlm`]; new code should use `ChatLlm`.
-/// The harness has no tools and no sandbox; it is purely a chat completion
-/// with a system prompt. Sessions are in-memory — one [`SoketLlm`] value
-/// holds one conversation, so "go deeper" follow-ups on a digest can reuse
-/// the same instance and keep context.
-pub struct SoketLlm {
-    harness: AgentHarness,
-}
-
-impl SoketLlm {
-    /// Builds the client: registers the Soket provider with the given API
-    /// key, refreshes the model catalog, picks `model_id` (e.g. `GLM-5.3`)
-    /// and raises its output limit to [`MAX_OUTPUT_TOKENS`].
-    pub async fn new(api_key: &str, model_id: &str) -> Result<Self, LlmError> {
-        let models = Arc::new(Models::new());
-        models.set_provider(soket_provider());
-        models.credentials().set(
-            SOKET_PROVIDER_ID,
-            Credential::ApiKey {
-                key: api_key.to_string(),
-            },
-        );
-
-        // Refresh the catalog so `model_id` resolves against the live Soket
-        // list. On failure the provider keeps its seed list; if the model is
-        // missing either way, `get_model` below reports it.
-        let refreshed = models
-            .refresh(ModelsRefreshOptions {
-                provider_id: Some(SOKET_PROVIDER_ID.to_string()),
-                ..Default::default()
-            })
-            .await;
-
-        let mut model = models
-            .get_model(SOKET_PROVIDER_ID, model_id)
-            .ok_or_else(|| {
-                let mut reason = format!("model {SOKET_PROVIDER_ID}/{model_id} is not available");
-                if let Some(err) = refreshed.errors.get(SOKET_PROVIDER_ID) {
-                    reason.push_str(&format!(" (catalog refresh failed: {err})"));
-                }
-                LlmError::Setup(reason)
-            })?;
-        model.max_tokens = MAX_OUTPUT_TOKENS;
-
-        // In-memory session: nothing persists between runs yet.
-        let store = create_in_memory_session_store();
-        let repository = create_session_repository(store, None);
-        let session = repository
-            .create(None, Some("paper-radar".into()))
-            .await
-            .map_err(|e| LlmError::Setup(format!("could not create LLM session: {e}")))?;
-
-        let harness = AgentHarness::new(AgentHarnessOptions {
-            models,
-            model: Some(model),
-            session,
-            host_env: Arc::new(HostExecutionEnv::new(std::env::temp_dir())),
-            tools: vec![],
-            system_prompt: String::new(),
-            sandbox: SandboxMode::Disabled,
-            resources: Default::default(),
-        });
-
-        Ok(Self { harness })
-    }
-}
-
-#[async_trait]
-impl LlmClient for SoketLlm {
-    async fn complete(&self, system: &str, prompt: &str) -> Result<String, LlmError> {
-        self.harness.set_system_prompt(system).await;
-        let message = self
-            .harness
-            .prompt(prompt)
-            .await
-            .map_err(|e| LlmError::Call(e.to_string()))?;
-
-        let assistant = message.as_assistant().ok_or_else(|| {
-            LlmError::Call("model turn produced no assistant message".to_string())
-        })?;
-        if let Some(failure) = assistant.failure() {
-            return Err(LlmError::Call(failure));
-        }
-
-        // Only text blocks carry the answer; thinking blocks are reasoning.
-        let text: String = assistant
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                AssistantContent::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-            .trim()
-            .to_string();
-
-        if text.is_empty() {
-            // Most often a `length` stop after reasoning ate the budget.
-            return Err(LlmError::EmptyReply);
-        }
-        Ok(text)
-    }
-
-    async fn reset(&self) -> Result<(), LlmError> {
-        self.harness
-            .start_new_session(None, Some("paper-radar".into()))
-            .await
-            .map(|_| ())
-            .map_err(|e| LlmError::Call(e.to_string()))
-    }
-}
-
 /// Scripted [`LlmClient`] for tests: returns queued replies in order and
 /// records every `(system, prompt)` pair it was given.
 pub struct FakeLlm {
@@ -404,7 +275,7 @@ impl LlmClient for FakeLlm {
                 LlmError::Call("fake LLM ran out of scripted replies".to_string())
             })?;
 
-        // Honour the trait contract the way SoketLlm does.
+        // Honour the trait contract the way ChatLlm does.
         if reply.trim().is_empty() {
             return Err(LlmError::EmptyReply);
         }
@@ -626,6 +497,38 @@ mod tests {
         let body = "Unauthorized: sk-secret-key-123 is invalid";
         assert_eq!(redact(body, &key), "Unauthorized: [REDACTED] is invalid");
         assert_eq!(redact("no key here", &key), "no key here");
+    }
+
+    #[test]
+    fn error_body_redaction_survives_truncation_at_the_limit() {
+        // The key straddles the 300-character cut: if truncation ran first,
+        // the tail of the key would survive into the error message.
+        let key = Secret::new("sk-straddle-key-0123456789");
+        let prefix = "x".repeat(290);
+        let suffix = "-and more text after the key";
+        let body = format!("{prefix}{}{suffix}", key.expose());
+
+        // Sanity: the key really does cross the 300-char boundary.
+        let key_start = body.find(key.expose()).expect("key must be in body");
+        assert!(
+            key_start < MAX_ERROR_BODY_CHARS
+                && key_start + key.expose().len() > MAX_ERROR_BODY_CHARS,
+            "test setup must place the key across the limit"
+        );
+
+        let out = truncate_chars(&redact(&body, &key), MAX_ERROR_BODY_CHARS);
+        assert!(
+            !out.contains(key.expose()),
+            "no part of the key may survive: {out:?}"
+        );
+        assert!(
+            !out.contains("straddle"),
+            "not even a fragment of the key may survive: {out:?}"
+        );
+        // The marker replaced the whole key before truncation, so the cut
+        // lands in ordinary text, and the result is capped at 300 chars.
+        assert!(out.contains("[REDACTED]"));
+        assert_eq!(out.chars().count(), MAX_ERROR_BODY_CHARS);
     }
 
     #[test]

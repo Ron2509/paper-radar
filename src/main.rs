@@ -99,7 +99,7 @@ async fn cmd_digest(dry_run: bool, feed_file: Option<std::path::PathBuf>) -> any
     let kept = filter::keyword_filter(papers, &config.topics.keywords);
     let keywords_kept = kept.len();
 
-    let llm = llm::SoketLlm::new(llm_key.expose(), &config.model.model).await?;
+    let llm = llm::ChatLlm::new(&config.model, llm_key)?;
     let scored = ranking::score_papers(&llm, &kept, &config.topics.topics).await;
     let picks = digest::select_papers(scored, config.digest.min_score, config.digest.max_papers);
 
